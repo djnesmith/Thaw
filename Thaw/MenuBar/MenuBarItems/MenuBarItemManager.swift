@@ -276,6 +276,16 @@ final class MenuBarItemManager: ObservableObject {
     /// Persisted per-section item order. Maps section key to an ordered list of
     /// `uniqueIdentifier` strings (right-to-left, matching cache array order).
     private var savedSectionOrder = [String: [String]]()
+
+    /// Per-namespace section memory. Maps a namespace description (typically a
+    /// bundle identifier) to its dominant section key. Used as a fallback when
+    /// an item's baseID (`namespace:title`) does not match any entry in
+    /// `savedSectionOrder` — e.g. apps like Badgeify that mutate the window
+    /// title to reflect badge counts, which churns the baseID and orphans
+    /// saved per-item positions. Once the user has placed an app's items
+    /// somewhere, future items from the same namespace land in that section.
+    private var savedSectionByNamespace = [String: String]()
+
     /// Placement preference for newly detected menu bar items.
     @Published private(set) var newItemsPlacement = NewItemsPlacement.defaultValue
 
@@ -340,6 +350,32 @@ final class MenuBarItemManager: ObservableObject {
         if let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: [String]] {
             savedSectionOrder = stored
         }
+    }
+
+    /// Loads persisted per-namespace section memory.
+    private func loadSavedSectionByNamespace() {
+        let key = "MenuBarItemManager.savedSectionByNamespace"
+        if let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: String] {
+            savedSectionByNamespace = stored
+        }
+    }
+
+    /// Persists per-namespace section memory.
+    private func persistSavedSectionByNamespace() {
+        let key = "MenuBarItemManager.savedSectionByNamespace"
+        UserDefaults.standard.set(savedSectionByNamespace, forKey: key)
+    }
+
+    /// Returns the saved section associated with the given namespace, if any.
+    /// Used as a fallback target when an item has no per-identifier saved
+    /// section but its app (namespace) has previously had items placed.
+    private func savedSectionForNamespace(_ namespace: MenuBarItemTag.Namespace) -> MenuBarSection.Name? {
+        guard let sectionKeyString = savedSectionByNamespace[namespace.description] else { return nil }
+        guard let section = sectionName(for: sectionKeyString) else { return nil }
+        if section == .alwaysHidden, appState?.settings.advanced.enableAlwaysHiddenSection != true {
+            return .hidden
+        }
+        return section
     }
 
     struct NewItemsPlacement: Codable, Equatable {
@@ -448,10 +484,44 @@ final class MenuBarItemManager: ObservableObject {
             }
         }
 
-        guard newOrder != savedSectionOrder else { return }
-        savedSectionOrder = newOrder
-        persistSavedSectionOrder()
-        MenuBarItemManager.diagLog.debug("Saved section order: \(newOrder.mapValues(\.count))")
+        // Per-namespace dominant section. For each namespace observed in the
+        // current cache, pick the section that holds the most of its items
+        // and record it. Entries for namespaces not present in the current
+        // cache (closed apps) are preserved, so the memory survives app
+        // quits and title mutations alike.
+        var perNamespaceCounts = [String: [MenuBarSection.Name: Int]]()
+        for section in MenuBarSection.Name.allCases {
+            for item in cache[section]
+                where !item.isControlItem
+                && item.sourcePID != nil
+                && !item.isTransientControlCenterItem
+            {
+                let nsKey = item.tag.namespace.description
+                guard !nsKey.isEmpty, nsKey != "null" else { continue }
+                perNamespaceCounts[nsKey, default: [:]][section, default: 0] += 1
+            }
+        }
+        var newByNamespace = savedSectionByNamespace
+        for (nsKey, counts) in perNamespaceCounts {
+            if let top = counts.max(by: { $0.value < $1.value })?.key {
+                newByNamespace[nsKey] = sectionKey(for: top)
+            }
+        }
+
+        let orderChanged = newOrder != savedSectionOrder
+        let namespaceChanged = newByNamespace != savedSectionByNamespace
+
+        if orderChanged {
+            savedSectionOrder = newOrder
+            persistSavedSectionOrder()
+        }
+        if namespaceChanged {
+            savedSectionByNamespace = newByNamespace
+            persistSavedSectionByNamespace()
+        }
+
+        guard orderChanged || namespaceChanged else { return }
+        MenuBarItemManager.diagLog.debug("Saved section order: \(newOrder.mapValues(\.count)); per-namespace: \(newByNamespace.count) entries")
     }
 
     /// Returns a persistable string key for the given section name.
@@ -725,9 +795,10 @@ final class MenuBarItemManager: ObservableObject {
     /// Returns the move destination that inserts a new item into the preferred section.
     private func newItemsMoveDestination(
         for controlItems: ControlItemPair,
-        among items: [MenuBarItem]
+        among items: [MenuBarItem],
+        overrideSection: MenuBarSection.Name? = nil
     ) -> MoveDestination {
-        let targetSection = effectiveNewItemsSection
+        let targetSection = overrideSection ?? effectiveNewItemsSection
         var context = CacheContext(
             controlItems: controlItems,
             displayID: Bridging.getActiveMenuBarDisplayID()
@@ -739,7 +810,13 @@ final class MenuBarItemManager: ObservableObject {
             return context.findSection(for: item) == targetSection
         }
 
-        if sectionName(for: newItemsPlacement.sectionKey) == targetSection,
+        // Honor the New Items badge anchor only when we're targeting the
+        // section the badge sits in (i.e. no namespace override is taking us
+        // somewhere else). Namespace-driven moves restore an item to where
+        // its app's other items live; they should not be reanchored to the
+        // badge.
+        if overrideSection == nil,
+           sectionName(for: newItemsPlacement.sectionKey) == targetSection,
            let anchorIdentifier = newItemsPlacement.anchorIdentifier,
            let anchorItem = resolvedNewItemsAnchorItem(
                for: anchorIdentifier,
@@ -840,6 +917,7 @@ final class MenuBarItemManager: ObservableObject {
         loadPinnedBundleIDs()
         loadPendingRelocations()
         loadSavedSectionOrder()
+        loadSavedSectionByNamespace()
         loadNewItemsPlacementPreference()
         MenuBarItemManager.diagLog.debug("performSetup: loaded \(knownItemIdentifiers.count) known identifiers, \(pinnedHiddenBundleIDs.count) pinned hidden, \(pinnedAlwaysHiddenBundleIDs.count) pinned always-hidden, \(savedSectionOrder.values.map(\.count)) saved order entries")
         // On first launch (no known identifiers), avoid auto-relocating the leftmost item
@@ -2597,6 +2675,21 @@ extension MenuBarItemManager {
         }
     }
 
+    /// Bundle identifiers whose processes are known to be slow to respond to
+    /// move events. Items owned by these processes get a higher default move
+    /// timeout and a higher adaptive ceiling so Thaw doesn't bail out with
+    /// `itemResponseTimeout` before the owning process has had a chance to
+    /// acknowledge the move. Match is by substring against the namespace so
+    /// Setapp variants (`-setapp` suffix) are covered automatically.
+    private static let slowMoveBundleIDs: [String] = [
+        "studio.techflow.badgeify",
+    ]
+
+    private func isSlowMoveItem(_ item: MenuBarItem) -> Bool {
+        let namespaceString = item.tag.namespace.description
+        return Self.slowMoveBundleIDs.contains(where: { namespaceString.contains($0) })
+    }
+
     /// Returns the default timeout for move operations associated
     /// with the given item.
     private func getDefaultMoveOperationTimeout(for item: MenuBarItem) -> Duration {
@@ -2604,6 +2697,12 @@ extension MenuBarItemManager {
             // Bento Boxes (i.e. Control Center groups) generally
             // take a little longer to respond.
             return .milliseconds(200)
+        }
+        if isSlowMoveItem(item) {
+            // Apps that proxy many status items through a single helper
+            // (Badgeify) routinely need >500ms to acknowledge a move while
+            // they're refreshing badge state on the main thread.
+            return .milliseconds(1000)
         }
         return .milliseconds(100)
     }
@@ -2625,7 +2724,8 @@ extension MenuBarItemManager {
         // Minimum of 75ms: waitForMoveEventResponse polls every 10ms, so a
         // timeout below ~75ms leaves too little margin for system event latency
         // and causes itemResponseTimeout → retry cascades.
-        let clamped = average.clamped(min: .milliseconds(75), max: .milliseconds(500))
+        let maxTimeout: Duration = isSlowMoveItem(item) ? .milliseconds(2000) : .milliseconds(500)
+        let clamped = average.clamped(min: .milliseconds(75), max: maxTimeout)
         moveOperationTimeouts[item.tag] = clamped
     }
 
@@ -4340,18 +4440,35 @@ extension MenuBarItemManager {
         knownItemIdentifiers.insert(identifier)
         persistKnownItemIdentifiers()
 
-        let destination = newItemsMoveDestination(for: controlItems, among: items)
+        // Prefer the section this app's items have lived in before, falling
+        // back to the user's New Items placement. This keeps apps like
+        // Badgeify (which mutate window titles to encode badge counts, and
+        // therefore churn their per-item baseIDs) in the section the user
+        // last placed them, instead of being treated as brand-new each time.
+        let namespaceSection = savedSectionForNamespace(candidate.tag.namespace)
+        let targetSection = namespaceSection ?? effectiveNewItemsSection
+        let destination = newItemsMoveDestination(
+            for: controlItems,
+            among: items,
+            overrideSection: namespaceSection
+        )
 
         // Skip no-op moves: item is already in the target section.
         var context = CacheContext(controlItems: controlItems, displayID: Bridging.getActiveMenuBarDisplayID())
-        if context.findSection(for: candidate) == effectiveNewItemsSection {
-            MenuBarItemManager.diagLog.debug("Skipping relocation for \(candidate.logString) — already in \(effectiveNewItemsSection.logString)")
+        if context.findSection(for: candidate) == targetSection {
+            MenuBarItemManager.diagLog.debug("Skipping relocation for \(candidate.logString) — already in \(targetSection.logString)")
             return false
         }
 
-        MenuBarItemManager.diagLog.info(
-            "Relocating new item \(candidate.logString) to \(effectiveNewItemsSection.logString)"
-        )
+        if let namespaceSection {
+            MenuBarItemManager.diagLog.info(
+                "Relocating new item \(candidate.logString) to \(namespaceSection.logString) (namespace fallback for \(candidate.tag.namespace.description))"
+            )
+        } else {
+            MenuBarItemManager.diagLog.info(
+                "Relocating new item \(candidate.logString) to \(targetSection.logString)"
+            )
+        }
 
         // Skip items with no valid bounds (transient clone windows etc.)
         guard Bridging.getWindowBounds(for: candidate.windowID) != nil else {
@@ -4531,6 +4648,18 @@ extension MenuBarItemManager {
         // restore before another one can start, preventing cascading icon moves when
         // multiple apps restart in quick succession (e.g. app update checks).
         guard !lastMoveOperationOccurred(within: .seconds(5)) else { return false }
+        // Skip the very first cache cycle after Thaw startup. With no
+        // previous snapshot we cannot tell whether a mismatch is from an
+        // app restart (legitimate target for restoration) or from the
+        // user rearranging icons while Thaw was offline (which should be
+        // adopted, not undone). Treat the first cycle as observational
+        // and let saveSectionOrder capture whatever the user did. Real
+        // restoration kicks in on subsequent cycles when previousWindowIDs
+        // gives us something to compare against.
+        guard !previousWindowIDs.isEmpty else {
+            MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: first cache after startup, skipping (treating current positions as authoritative)")
+            return false
+        }
 
         let currentWindowIDSet = Set(items.map(\.windowID))
         let previousWindowIDSet = Set(previousWindowIDs)
@@ -4622,8 +4751,18 @@ extension MenuBarItemManager {
 
         let hasMisplacedItems = findFirstRebalanceMove() != nil
 
-        guard windowIDsChanged || hasMisplacedItems else {
-            MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: no app restart detected and no misplaced items, skipping")
+        // Restore only when an app restart actually happened (windowID change).
+        // A pure "items are misplaced" signal without a restart almost always
+        // means the user dragged something — either via Thaw's Layout editor
+        // or via macOS Command-drag in the menu bar. Undoing the user's drag
+        // is worse than leaving an app-induced misplacement in place; the
+        // next cache cycle's saveSectionOrder will adopt the new position.
+        guard windowIDsChanged else {
+            if hasMisplacedItems {
+                MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: items misplaced but no app restart — treating as user intent, letting saveSectionOrder adopt")
+            } else {
+                MenuBarItemManager.diagLog.debug("restoreItemsToSavedSections: no app restart detected and no misplaced items, skipping")
+            }
             return false
         }
 
