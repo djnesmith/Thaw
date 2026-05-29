@@ -318,6 +318,16 @@ final class MenuBarItemManager: ObservableObject {
     /// Persisted per-section item order. Maps section key to an ordered list of
     /// `uniqueIdentifier` strings (right-to-left, matching cache array order).
     private var savedSectionOrder = [String: [String]]()
+
+    /// Per-namespace section memory. Maps a namespace description (typically a
+    /// bundle identifier) to its dominant section key. Used as a fallback when
+    /// an item's baseID (`namespace:title`) does not match any entry in
+    /// `savedSectionOrder` — e.g. apps like Badgeify that mutate the window
+    /// title to reflect badge counts, which churns the baseID and orphans
+    /// saved per-item positions. Once the user has placed an app's items
+    /// somewhere, future items from the same namespace land in that section.
+    private var savedSectionByNamespace = [String: String]()
+
     /// Placement preference for newly detected menu bar items.
     @Published private(set) var newItemsPlacement = NewItemsPlacement.defaultValue
 
@@ -382,6 +392,32 @@ final class MenuBarItemManager: ObservableObject {
         if let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: [String]] {
             savedSectionOrder = stored
         }
+    }
+
+    /// Loads persisted per-namespace section memory.
+    private func loadSavedSectionByNamespace() {
+        let key = "MenuBarItemManager.savedSectionByNamespace"
+        if let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: String] {
+            savedSectionByNamespace = stored
+        }
+    }
+
+    /// Persists per-namespace section memory.
+    private func persistSavedSectionByNamespace() {
+        let key = "MenuBarItemManager.savedSectionByNamespace"
+        UserDefaults.standard.set(savedSectionByNamespace, forKey: key)
+    }
+
+    /// Returns the saved section associated with the given namespace, if any.
+    /// Used as a fallback target when an item has no per-identifier saved
+    /// section but its app (namespace) has previously had items placed.
+    private func savedSectionForNamespace(_ namespace: MenuBarItemTag.Namespace) -> MenuBarSection.Name? {
+        guard let sectionKeyString = savedSectionByNamespace[namespace.description] else { return nil }
+        guard let section = sectionName(for: sectionKeyString) else { return nil }
+        if section == .alwaysHidden, appState?.settings.advanced.enableAlwaysHiddenSection != true {
+            return .hidden
+        }
+        return section
     }
 
     struct NewItemsPlacement: Codable, Equatable {
@@ -554,18 +590,58 @@ final class MenuBarItemManager: ObservableObject {
         return newOrder
     }
 
+    /// Recomputes the per-namespace dominant-section memory from the
+    /// current cache. For each namespace observed, picks the section
+    /// that holds the most of its items and records it. Entries for
+    /// namespaces not present in the cache (closed apps) are preserved
+    /// so the memory survives app quits and title mutations.
+    private func computeSectionByNamespace(from cache: ItemCache) -> [String: String] {
+        var perNamespaceCounts = [String: [MenuBarSection.Name: Int]]()
+        for section in MenuBarSection.Name.allCases {
+            for item in cache[section]
+                where !item.isControlItem
+                && item.sourcePID != nil
+                && !item.isTransientControlCenterItem
+            {
+                let nsKey = item.tag.namespace.description
+                guard !nsKey.isEmpty, nsKey != "null" else { continue }
+                perNamespaceCounts[nsKey, default: [:]][section, default: 0] += 1
+            }
+        }
+        var result = savedSectionByNamespace
+        for (nsKey, counts) in perNamespaceCounts {
+            if let top = counts.max(by: { $0.value < $1.value })?.key {
+                result[nsKey] = sectionKey(for: top)
+            }
+        }
+        return result
+    }
+
     /// Extracts the current per-section item order from the given cache
     /// and persists it to savedSectionOrder. Skips the write when the
     /// order has not changed. Delegates the dict construction to
     /// computeSectionOrder so the "what does the curated section order
     /// look like?" question has a single answer used by both periodic
-    /// save and profile capture.
+    /// save and profile capture. Also refreshes the per-namespace
+    /// section memory in lockstep (computeSectionByNamespace).
     private func saveSectionOrder(from cache: ItemCache) {
         let newOrder = computeSectionOrder(from: cache)
-        guard newOrder != savedSectionOrder else { return }
-        savedSectionOrder = newOrder
-        persistSavedSectionOrder()
-        MenuBarItemManager.diagLog.debug("Saved section order: \(newOrder.mapValues(\.count))")
+        let newByNamespace = computeSectionByNamespace(from: cache)
+
+        let orderChanged = newOrder != savedSectionOrder
+        let namespaceChanged = newByNamespace != savedSectionByNamespace
+
+        if orderChanged {
+            savedSectionOrder = newOrder
+            persistSavedSectionOrder()
+        }
+        if namespaceChanged {
+            savedSectionByNamespace = newByNamespace
+            persistSavedSectionByNamespace()
+        }
+
+        guard orderChanged || namespaceChanged else { return }
+        MenuBarItemManager.diagLog.debug("Saved section order: \(newOrder.mapValues(\.count)); per-namespace: \(newByNamespace.count) entries")
     }
 
     /// Returns a persistable string key for the given section name.
@@ -839,9 +915,10 @@ final class MenuBarItemManager: ObservableObject {
     /// Returns the move destination that inserts a new item into the preferred section.
     private func newItemsMoveDestination(
         for controlItems: ControlItemPair,
-        among items: [MenuBarItem]
+        among items: [MenuBarItem],
+        overrideSection: MenuBarSection.Name? = nil
     ) -> MoveDestination {
-        let targetSection = effectiveNewItemsSection
+        let targetSection = overrideSection ?? effectiveNewItemsSection
         var context = CacheContext(
             controlItems: controlItems,
             displayID: Bridging.getActiveMenuBarDisplayID()
@@ -853,7 +930,13 @@ final class MenuBarItemManager: ObservableObject {
             return context.findSection(for: item) == targetSection
         }
 
-        if sectionName(for: newItemsPlacement.sectionKey) == targetSection,
+        // Honor the New Items badge anchor only when we're targeting the
+        // section the badge sits in (i.e. no namespace override is taking us
+        // somewhere else). Namespace-driven moves restore an item to where
+        // its app's other items live; they should not be reanchored to the
+        // badge.
+        if overrideSection == nil,
+           sectionName(for: newItemsPlacement.sectionKey) == targetSection,
            let anchorIdentifier = newItemsPlacement.anchorIdentifier,
            let anchorItem = resolvedNewItemsAnchorItem(
                for: anchorIdentifier,
@@ -954,6 +1037,7 @@ final class MenuBarItemManager: ObservableObject {
         loadPinnedBundleIDs()
         loadPendingRelocations()
         loadSavedSectionOrder()
+        loadSavedSectionByNamespace()
         loadNewItemsPlacementPreference()
         MenuBarItemManager.diagLog.debug("performSetup: loaded \(knownItemIdentifiers.count) known identifiers, \(pinnedHiddenBundleIDs.count) pinned hidden, \(pinnedAlwaysHiddenBundleIDs.count) pinned always-hidden, \(savedSectionOrder.values.map(\.count)) saved order entries")
         // On first launch (no known identifiers), avoid auto-relocating the leftmost item
@@ -2955,6 +3039,46 @@ extension MenuBarItemManager {
         }
     }
 
+    /// Bundle identifiers whose processes are known to be slow to respond to
+    /// move events. Items owned by these processes get a higher default move
+    /// timeout and a higher adaptive ceiling so Thaw doesn't bail out with
+    /// `itemResponseTimeout` before the owning process has had a chance to
+    /// acknowledge the move. Match is by substring against the namespace so
+    /// Setapp variants (`-setapp` suffix) are covered automatically.
+    private static let slowMoveBundleIDs: [String] = [
+        "studio.techflow.badgeify",
+    ]
+
+    private func isSlowMoveItem(_ item: MenuBarItem) -> Bool {
+        let namespaceString = item.tag.namespace.description
+        return Self.slowMoveBundleIDs.contains(where: { namespaceString.contains($0) })
+    }
+
+    /// Bundle identifiers whose synthetic Cmd+drag moves cause the owning
+    /// app to spuriously activate as if the icon had been clicked, even
+    /// with the modifier held and an intermediate mouseDragged event.
+    /// Badgeify's icons are hooked by a low-level event tap that treats
+    /// any mouseDown at the icon location as "user clicked, open my
+    /// target app," ignoring modifier flags and drag phase. Thaw skips
+    /// bulk-apply moves of these items entirely; their positions are
+    /// left to macOS defaults instead of enforced by the saved layout.
+    /// The trade-off (slight layout drift for Badgeify's items) beats
+    /// the misbehavior (five apps unexpectedly launched every time the
+    /// full-sort runs).
+    private static let skipBulkMoveBundleIDs: [String] = [
+        "studio.techflow.badgeify",
+    ]
+
+    /// Returns whether the given item should be excluded from bulk
+    /// moves (e.g. full-sort within `applyProfileLayout`). Direct moves
+    /// initiated by the user (drag in the Layout editor,
+    /// `temporarilyShow`) still proceed — this only skips
+    /// automation-driven bulk reshuffles.
+    private func shouldSkipBulkMove(for item: MenuBarItem) -> Bool {
+        let namespaceString = item.tag.namespace.description
+        return Self.skipBulkMoveBundleIDs.contains(where: { namespaceString.contains($0) })
+    }
+
     /// Returns the default timeout for move operations associated
     /// with the given item.
     private func getDefaultMoveOperationTimeout(for item: MenuBarItem) -> Duration {
@@ -2962,6 +3086,12 @@ extension MenuBarItemManager {
             // Bento Boxes (i.e. Control Center groups) generally
             // take a little longer to respond.
             return .milliseconds(200)
+        }
+        if isSlowMoveItem(item) {
+            // Apps that proxy many status items through a single helper
+            // (Badgeify) routinely need >500ms to acknowledge a move while
+            // they're refreshing badge state on the main thread.
+            return .milliseconds(1000)
         }
         return .milliseconds(100)
     }
@@ -2983,7 +3113,8 @@ extension MenuBarItemManager {
         // Minimum of 75ms: waitForMoveEventResponse polls every 10ms, so a
         // timeout below ~75ms leaves too little margin for system event latency
         // and causes itemResponseTimeout → retry cascades.
-        let clamped = average.clamped(min: .milliseconds(75), max: .milliseconds(500))
+        let maxTimeout: Duration = isSlowMoveItem(item) ? .milliseconds(2000) : .milliseconds(500)
+        let clamped = average.clamped(min: .milliseconds(75), max: maxTimeout)
         moveOperationTimeouts[item.tag] = clamped
     }
 
@@ -3180,12 +3311,31 @@ extension MenuBarItemManager {
 
         try permitLocalEvents()
 
+        // Midpoint between start and end. Used for an intermediate
+        // mouseDragged event so the gesture reads as a drag rather than
+        // a click to apps that watch their status item's window. Without
+        // any dragged events, status-item-click utilities (Badgeify and
+        // similar toggle-on-click apps) see only mouseDown→mouseUp at
+        // the icon and fire their click action even when Cmd is held.
+        // A single dragged event in the middle of the gesture is enough
+        // for those apps to bail out of "this was a click" logic.
+        let dragMidpoint = CGPoint(
+            x: (targetPoints.start.x + targetPoints.end.x) / 2,
+            y: (targetPoints.start.y + targetPoints.end.y) / 2
+        )
+
         guard
             let mouseDown = CGEvent.menuBarItemEvent(
                 item: item,
                 source: source,
                 type: .move(.mouseDown),
                 location: targetPoints.start
+            ),
+            let mouseDragged = CGEvent.menuBarItemEvent(
+                item: item,
+                source: source,
+                type: .move(.mouseDragged),
+                location: dragMidpoint
             ),
             let mouseUp = CGEvent.menuBarItemEvent(
                 item: destination.targetItem,
@@ -3258,6 +3408,22 @@ extension MenuBarItemManager {
                 initialOrigin: itemOrigin,
                 timeout: timeout
             )
+            // Intermediate mouseDragged event. Best-effort: if it
+            // fails (e.g. rejected because the mouseDown event was
+            // dropped) keep going — the original two-event move is
+            // still posted below and remains the correctness path.
+            // The point of this event is purely to convince status-
+            // item-click utilities that the gesture is a drag, not
+            // a click, so they don't fire their action on mouseUp.
+            do {
+                try await scrombleEvent(
+                    mouseDragged,
+                    item: item,
+                    timeout: timeout
+                )
+            } catch {
+                MenuBarItemManager.diagLog.debug("mouseDragged event failed (continuing): \(error)")
+            }
             try await scrombleEvent(
                 mouseUp,
                 item: item,
@@ -3535,7 +3701,11 @@ extension MenuBarItemManager {
     /// - Parameters:
     ///   - item: The menu bar item to click.
     ///   - mouseButton: The mouse button to click the item with.
-    private func postClickEvents(item: MenuBarItem, mouseButton: CGMouseButton) async throws {
+    private func postClickEvents(
+        item: MenuBarItem,
+        mouseButton: CGMouseButton,
+        warpCursorBack: Bool = true
+    ) async throws {
         // Try to acquire semaphore with timeout. 3.5 s covers legitimate slow
         // operations (adaptive click cap is 1000 ms × 2 for double mouseUp =
         // ~2 s of event work plus overhead).
@@ -3598,7 +3768,17 @@ extension MenuBarItemManager {
         try await Task.sleep(for: .milliseconds(10))
         MouseHelpers.hideCursor()
         defer {
-            MouseHelpers.warpCursor(to: mouseLocation)
+            // Restore the cursor to its pre-click location only when the
+            // caller wants it. In the temporarily-shown flow the caller
+            // passes `warpCursorBack: false` so the cursor stays over
+            // the just-clicked icon. Warping back to the user's original
+            // location (typically outside the newly-opened popup) can
+            // cause Electron-hosted menus (e.g. Docker Desktop) to
+            // resign key and dismiss themselves before the user has a
+            // chance to interact.
+            if warpCursorBack {
+                MouseHelpers.warpCursor(to: mouseLocation)
+            }
             MouseHelpers.showCursor()
         }
 
@@ -3746,7 +3926,13 @@ extension MenuBarItemManager {
     ///   - maxAttempts: Maximum number of click attempts (default 3).
     ///     Pass `1` from `temporarilyShow` so a single failure returns
     ///     immediately and the caller's fallback path fires promptly.
-    func click(item: MenuBarItem, with mouseButton: CGMouseButton, skipInputPause: Bool = false, maxAttempts: Int = 3) async throws {
+    func click(
+        item: MenuBarItem,
+        with mouseButton: CGMouseButton,
+        skipInputPause: Bool = false,
+        maxAttempts: Int = 3,
+        warpCursorBack: Bool = true
+    ) async throws {
         guard let appState else {
             throw EventError.cannotComplete
         }
@@ -3775,7 +3961,7 @@ extension MenuBarItemManager {
             }
             do {
                 let clickStartTime = Date.now
-                try await postClickEvents(item: item, mouseButton: mouseButton)
+                try await postClickEvents(item: item, mouseButton: mouseButton, warpCursorBack: warpCursorBack)
                 let clickDuration = Date.now.timeIntervalSince(clickStartTime)
                 MenuBarItemManager.diagLog.debug("Attempt \(n) succeeded in \(Int(clickDuration * 1000))ms, finished with click")
                 return
@@ -3831,6 +4017,14 @@ extension MenuBarItemManager {
         /// The window of the item's shown interface.
         var shownInterfaceWindow: WindowInfo?
 
+        /// Snapshot of windowIDs that existed at context creation, used
+        /// by `appHasVisiblePopup` to exclude the owning process's
+        /// pre-existing background windows (e.g. Docker Desktop's
+        /// long-lived helper window at status level) from the popup
+        /// heuristic. Any window with an ID in this set is not the
+        /// menu we just opened.
+        var windowIDsBeforeShow = Set<CGWindowID>()
+
         /// The number of attempts that have been made to rehide the item.
         var rehideAttempts = 0
 
@@ -3842,7 +4036,7 @@ extension MenuBarItemManager {
 
         /// Timestamp for when the item was first shown so we can honor
         /// a short grace period for menus that use nonstandard windows.
-        private let firstShownDate = Date.now
+        let firstShownDate = Date.now
 
         /// Minimum time to treat the item as "showing" even if we can't
         /// detect a popup window (helps apps with unusual window levels).
@@ -3883,15 +4077,17 @@ extension MenuBarItemManager {
                 return current.isOnScreen
             }
 
-            // The tracked window is gone or was never captured. During the
-            // grace period, assume the interface is still showing to give
+            // No tracked window was ever captured. During the grace
+            // period, assume the interface is still showing to give
             // apps with nonstandard windows time to create them.
             if Date.now.timeIntervalSince(firstShownDate) < graceInterval {
                 return true
             }
 
-            // Grace period expired and no tracked window. Check whether the
-            // app has any visible popup or overlay window that we missed.
+            // Grace period expired and we never captured a popup.
+            // Fall back to searching for a matching window from the
+            // owning process — this is a last-resort heuristic and
+            // is only reached when the up-front polling failed.
             return appHasVisiblePopup()
         }
 
@@ -3915,6 +4111,14 @@ extension MenuBarItemManager {
             let mainMenuLevel = CGWindowLevelForKey(.mainMenuWindow)
             return windows.contains { window in
                 guard window.ownerPID == sourcePID else {
+                    return false
+                }
+                // Exclude the app's pre-existing windows (recorded at
+                // context creation). Some apps keep long-lived helper
+                // windows at status/menu-bar levels (e.g. Docker
+                // Desktop) that would otherwise trigger this heuristic
+                // forever, preventing the icon from ever rehiding.
+                guard !windowIDsBeforeShow.contains(window.windowID) else {
                     return false
                 }
                 let level = CGWindowLevel(Int32(window.layer))
@@ -4045,11 +4249,15 @@ extension MenuBarItemManager {
                 await self.rehideTemporarilyShownItems()
             }
         }
-        // Also rehide when frontmost app changes (smart-ish).
-        // Debounce so rapid app switches (Cmd-Tab spam) collapse to one
-        // rehide attempt instead of queuing a separate Task per change ;
-        // each rehide call can do an expensive on-screen window enumeration.
+        // Also rehide when frontmost app changes (smart-ish). Compare
+        // by PID to filter out non-changes: KVO can emit the same
+        // frontmost value repeatedly, and without `removeDuplicates`
+        // that flooded the rehide path with hundreds of no-op checks
+        // per second, each of which could sneak the rehide through a
+        // brief lull in user input.
         rehideCancellable = NSWorkspace.shared.publisher(for: \.frontmostApplication)
+            .map { $0?.processIdentifier ?? 0 }
+            .removeDuplicates()
             .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
@@ -4321,7 +4529,7 @@ extension MenuBarItemManager {
                 // Single attempt: the item is already at a known-good position with
                 // fresh bounds. If it fails, fall through to the fallback path below
                 // rather than spending 3× the semaphore timeout here.
-                try await click(item: clickItem, with: mouseButton, skipInputPause: true, maxAttempts: 1)
+                try await click(item: clickItem, with: mouseButton, skipInputPause: true, maxAttempts: 1, warpCursorBack: false)
             } catch {
                 MenuBarItemManager.diagLog.error("Error clicking item (first attempt): \(error); attempting fallback click")
 
@@ -4340,7 +4548,7 @@ extension MenuBarItemManager {
                 // the fallback succeeds, keeping isShowingInterface accurate for
                 // the rehide logic.
                 do {
-                    try await click(item: fallbackItem, with: mouseButton, skipInputPause: true)
+                    try await click(item: fallbackItem, with: mouseButton, skipInputPause: true, warpCursorBack: false)
                 } catch {
                     MenuBarItemManager.diagLog.error("Fallback click also failed for \(item.logString): \(error)")
                     // Icon is visible but both click attempts failed.
@@ -4349,13 +4557,46 @@ extension MenuBarItemManager {
             }
         }
 
-        // Capture the popup window opened by whichever click path succeeded.
-        await eventSleep(for: .milliseconds(100))
-        let windowsAfterClick = WindowInfo.createWindows(option: .onScreen)
-
-        context.shownInterfaceWindow = windowsAfterClick.first { window in
-            window.ownerPID == clickPID && !idsBeforeClick.contains(window.windowID)
+        // Capture the popup window opened by whichever click path
+        // succeeded. Some apps (Electron-based menu bar utilities such as
+        // Docker Desktop) take significantly longer than 100 ms to spawn
+        // their menu window, and the one-shot check missed them,
+        // leaving `shownInterfaceWindow` nil. Without that reference
+        // the `isShowingInterface` check falls back to the level-based
+        // scan which doesn't reliably match Electron-hosted panels, so
+        // the rehide timer fires before the user can interact and the
+        // menu is dismissed with the item's move. Poll every 50 ms up
+        // to 1500 ms; break as soon as a new window owned by the
+        // clicked app appears. Fall back to matching by bundle
+        // identifier because Electron apps sometimes render their
+        // menu from a helper process whose PID differs from the menu
+        // bar item's ownerPID.
+        let clickBundleID = NSRunningApplication(processIdentifier: clickPID)?.bundleIdentifier
+        var newWindow: WindowInfo?
+        let popPollDeadline = Date.now.addingTimeInterval(1.5)
+        while Date.now < popPollDeadline {
+            await eventSleep(for: .milliseconds(50))
+            let windowsAfterClick = WindowInfo.createWindows(option: .onScreen)
+            if let match = windowsAfterClick.first(where: { window in
+                guard !idsBeforeClick.contains(window.windowID) else { return false }
+                if window.ownerPID == clickPID { return true }
+                if let clickBundleID,
+                   let winBundleID = NSRunningApplication(processIdentifier: window.ownerPID)?.bundleIdentifier,
+                   winBundleID == clickBundleID
+                {
+                    return true
+                }
+                return false
+            }) {
+                newWindow = match
+                break
+            }
         }
+        context.shownInterfaceWindow = newWindow
+        // Record the set of windowIDs that existed before the click so
+        // the isShowingInterface fallback (`appHasVisiblePopup`) can
+        // exclude the app's pre-existing background windows.
+        context.windowIDsBeforeShow = idsBeforeClick
 
         return .movedAndClicked
     }
@@ -4457,16 +4698,74 @@ extension MenuBarItemManager {
         MenuBarItemManager.diagLog.debug("rehideTemporarilyShownItems: started (force=\(force), isCalledFromTemporarilyShow=\(isCalledFromTemporarilyShow))")
 
         if !force {
-            guard !temporarilyShownItemContexts.contains(where: \.isShowingInterface) else {
-                MenuBarItemManager.diagLog.debug("Menu bar item interface is shown, so waiting to rehide")
-                runRehideTimer(for: 3)
-                return
-            }
-            guard hasUserPausedInput(for: .milliseconds(250)) else {
-                MenuBarItemManager.diagLog.debug("Found recent user input, so waiting to rehide")
+            // Very short minimum-show floor. Only prevents the "menu
+            // opens then flashes back to hidden" race in the first
+            // moments after the click — the popup detection below is
+            // the primary signal for holding the icon in place while
+            // the menu is open.
+            let minimumShowInterval: TimeInterval = 1
+            if temporarilyShownItemContexts.contains(where: {
+                Date.now.timeIntervalSince($0.firstShownDate) < minimumShowInterval
+            }) {
+                MenuBarItemManager.diagLog.info("rehideCheck: deferring (min-show < \(Int(minimumShowInterval))s)")
                 runRehideTimer(for: 1)
                 return
             }
+            // Owning-app-frontmost check. If the frontmost app owns one
+            // of our temp-shown items, the user is still interacting
+            // with whatever that click surfaced (a menu, a popover, an
+            // Electron-hosted panel). This is a more reliable "still in
+            // use" signal than the window-level heuristics inside
+            // `isShowingInterface`, which miss menus that some apps
+            // (e.g. Docker Desktop) draw at non-standard window levels.
+            //
+            // Compare via the item's tag namespace (its true bundle ID)
+            // with a prefix match against the frontmost app's bundle ID.
+            // Electron apps have many processes: main + Renderer + GPU +
+            // Plugin helpers with bundle IDs like
+            // com.electron.dockerdesktop, .helper, .helper.GPU, etc.
+            // Any of them being frontmost still means the user is in
+            // that app; a prefix match covers all of them.
+            let frontmost = NSWorkspace.shared.frontmostApplication
+            let frontmostBundleID = frontmost?.bundleIdentifier
+            let contextNamespaces: [String] = temporarilyShownItemContexts.compactMap { ctx in
+                let ns = ctx.tag.namespace.description
+                return ns == "null" || ns.isEmpty ? nil : ns
+            }
+            if let frontmostBundleID,
+               contextNamespaces.contains(where: { ns in
+                   frontmostBundleID == ns || frontmostBundleID.hasPrefix(ns + ".")
+               })
+            {
+                MenuBarItemManager.diagLog.info("rehideCheck: deferring (frontmost=\(frontmostBundleID) matches namespace)")
+                runRehideTimer(for: 3)
+                return
+            }
+            if let frontmostPID = frontmost?.processIdentifier,
+               temporarilyShownItemContexts.contains(where: { $0.sourcePID == frontmostPID })
+            {
+                MenuBarItemManager.diagLog.info("rehideCheck: deferring (frontmost PID matches sourcePID)")
+                runRehideTimer(for: 3)
+                return
+            }
+            guard !temporarilyShownItemContexts.contains(where: \.isShowingInterface) else {
+                MenuBarItemManager.diagLog.info("rehideCheck: deferring (interface still showing)")
+                runRehideTimer(for: 3)
+                return
+            }
+            // Short input-idle threshold. The popup-visible and
+            // frontmost checks above are the real "still engaged"
+            // signals now; this is just belt-and-suspenders to keep
+            // rehide from firing mid-drag or mid-click. 500 ms of
+            // input quiet means the user has stopped actively
+            // manipulating the menu bar, so if the popup is closed
+            // and their app isn't frontmost, they've moved on.
+            guard hasUserPausedInput(for: .milliseconds(500)) else {
+                MenuBarItemManager.diagLog.info("rehideCheck: deferring (user input < 500ms ago)")
+                runRehideTimer(for: 1)
+                return
+            }
+            MenuBarItemManager.diagLog.info("rehideCheck: proceeding (all guards passed)")
         }
 
         var currentContexts = temporarilyShownItemContexts
@@ -4743,11 +5042,27 @@ extension MenuBarItemManager {
             knownItemIdentifiers.insert(identifierToMark)
             persistKnownItemIdentifiers()
 
-            let destination = newItemsMoveDestination(for: controlItems, among: items)
-
-            MenuBarItemManager.diagLog.info(
-                "Relocating new item \(candidate.logString) to \(effectiveNewItemsSection.logString)"
+            // Prefer the section this app's items have lived in before,
+            // falling back to the user's New Items placement. This keeps
+            // apps that mutate window titles (e.g. Badgeify encoding
+            // badge counts) in the section the user last placed them
+            // instead of being treated as brand-new each time.
+            let namespaceSection = savedSectionForNamespace(candidate.tag.namespace)
+            let destination = newItemsMoveDestination(
+                for: controlItems,
+                among: items,
+                overrideSection: namespaceSection
             )
+
+            if let namespaceSection {
+                MenuBarItemManager.diagLog.info(
+                    "Relocating new item \(candidate.logString) to \(namespaceSection.logString) (namespace fallback for \(candidate.tag.namespace.description))"
+                )
+            } else {
+                MenuBarItemManager.diagLog.info(
+                    "Relocating new item \(candidate.logString) to \(effectiveNewItemsSection.logString)"
+                )
+            }
 
             // Skip items with no valid bounds (transient clone windows
             // etc.). This live check stays in the orchestrator because
@@ -5136,8 +5451,15 @@ private enum MenuBarItemEventType {
 
     var cgEventFlags: CGEventFlags {
         switch self {
-        case .move(.mouseDown): .maskCommand
-        case .move, .click: []
+        // Hold Cmd through the entire move gesture (both mouseDown and
+        // mouseUp). Without Cmd on mouseUp, apps that watch their status
+        // item's window for a left-click (Badgeify and similar
+        // toggle-on-click utilities) read the bare mouseUp as a real
+        // click and activate. With Cmd held on the mouseUp the click
+        // handler typically bails because a modifier is pressed, while
+        // the OS still treats the whole gesture as a Cmd-drag rearrange.
+        case .move: .maskCommand
+        case .click: []
         }
     }
 
@@ -5153,11 +5475,13 @@ private enum MenuBarItemEventType {
     /// Subtype for menu bar item move events.
     enum MoveSubtype {
         case mouseDown
+        case mouseDragged
         case mouseUp
 
         var cgEventType: CGEventType {
             switch self {
             case .mouseDown: .leftMouseDown
+            case .mouseDragged: .leftMouseDragged
             case .mouseUp: .leftMouseUp
             }
         }
@@ -6206,6 +6530,16 @@ extension MenuBarItemManager {
                     continue
                 }
 
+                // Skip bulk-move for items whose owning app misbehaves
+                // in response to Cmd+drag events (e.g. Badgeify's tray
+                // hook that opens the target app on any mouseDown at
+                // its icon). Layout drift for those items is preferable
+                // to opening five apps every time the full-sort runs.
+                if shouldSkipBulkMove(for: item) {
+                    MenuBarItemManager.diagLog.info("Profile layout (full sort): skipping bulk move for \(uid) (bundle in skipBulkMoveBundleIDs)")
+                    continue
+                }
+
                 guard let cc = freshItems.first(where: { $0.tag == .controlCenter }) else {
                     MenuBarItemManager.diagLog.error("Profile layout (full sort): Control Center not found")
                     break
@@ -6799,11 +7133,21 @@ extension MenuBarItemManager {
             previousDisplayID: previousDisplayID,
             currentDisplayID: currentDisplayID
         )
-        let layoutDiverged = windowIDsChanged
-            ? false
-            : currentLayoutDivergesFromSaved(items: items, controlItems: controlItems)
-        guard windowIDsChanged || layoutDiverged else {
-            MenuBarItemManager.diagLog.debug("applySavedLayout: skipping, no windowID change and saved layout matches current")
+        // Upstream also fires `applySavedLayout` when the current layout
+        // merely diverges from saved — meant to catch ambient drift from
+        // Stage Manager, screen lock/unlock, third-party menu bar tools,
+        // etc. In practice this turns into a "big reset" on every new
+        // icon: `relocateNewLeftmostItems` moves the new icon to the
+        // user's New Items section, that move shifts everyone else by a
+        // few pixels, the divergence check trips, and the bulk full-sort
+        // walks every item back to its saved slot. Restrict the trigger
+        // to actual app restarts (windowID change, filtered by the new
+        // Self.windowIDsChanged helper which already ignores display
+        // switches); divergence-only applies are skipped. App relaunch
+        // recovery still works. `currentLayoutDivergesFromSaved` is left
+        // in place for future use if we re-introduce a smarter trigger.
+        guard windowIDsChanged else {
+            MenuBarItemManager.diagLog.debug("applySavedLayout: skipping, no windowID change (divergence-only trigger disabled)")
             return false
         }
 
@@ -6868,7 +7212,7 @@ extension MenuBarItemManager {
             }
         }
 
-        let trigger = windowIDsChanged ? "windowID change" : "layout divergence"
+        let trigger = "windowID change"
         MenuBarItemManager.diagLog.info("applySavedLayout: dispatching bulk apply (\(trigger))")
 
         // The shared body uses itemOrder as the per-section ordered

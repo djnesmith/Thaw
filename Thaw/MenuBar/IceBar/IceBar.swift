@@ -256,7 +256,16 @@ final class IceBarPanel: NSPanel {
         cacheTask?.cancel()
         cacheTask = Task { [weak appState] in
             guard let appState else { return }
-            await appState.itemManager.rehideTemporarilyShownItems(force: true)
+            // Non-forced rehide so the minimum-show / frontmost-owner /
+            // isShowingInterface guards get a chance to defer. Forcing
+            // here (previous behavior) blew away any currently-active
+            // temp-shown item every time the Thaw Bar re-opened, which
+            // meant a stray hover on the Thaw icon while the user was
+            // interacting with a hidden app's menu (e.g. Docker
+            // Desktop) tore the interaction down before the user could
+            // finish. The guards inside rehideTemporarilyShownItems
+            // already know when it's safe to clear stale contexts.
+            await appState.itemManager.rehideTemporarilyShownItems()
             guard !Task.isCancelled else { return }
             // Settle delay: when the IceBar just opened on a screen that
             // was previously inactive, the menu bar has moved screens and
