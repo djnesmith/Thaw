@@ -105,7 +105,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO
 
       - name: Convert coverage to XML
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'stonerl/Thaw' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           XCRESULTPARSER_VERSION: "2.0.1"
         run: |
@@ -117,7 +117,7 @@ jobs:
           ./product/xcresultparser -c -o xml "$NEWEST_BUNDLE" > coverage.xml
 
       - name: Upload Coverage XML
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'stonerl/Thaw' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/upload-artifact@v7
         with:
           name: coverage-data
@@ -126,7 +126,11 @@ jobs:
           if-no-files-found: error
 
   sonarqube:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Only runs on the upstream repo (stonerl/Thaw) where the SONAR_TOKEN
+    # secret and SonarCloud project (stonerl_Thaw) are configured. Forks
+    # like djnesmith/Thaw don't have those set up and would otherwise fail
+    # the scan step; skipping them here keeps fork CI green.
+    if: github.repository == 'stonerl/Thaw' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -146,11 +150,11 @@ jobs:
 
   # Dummy job that passes for forks (no access to SONAR_TOKEN secret)
   sonarqube-skip-forks:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    if: github.repository != 'stonerl/Thaw' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-slim
     needs: build
     steps:
       - name: Skip SonarQube for fork PRs
         run: |
-          echo "Skipping SonarQube analysis for PR from fork"
-          echo "Analysis will be performed after merge to main branch"
+          echo "Skipping SonarQube analysis (not the upstream stonerl/Thaw repository)"
+          echo "Analysis is performed by upstream CI on stonerl/Thaw"
