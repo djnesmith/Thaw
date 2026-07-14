@@ -5042,6 +5042,20 @@ extension MenuBarItemManager {
             knownItemIdentifiers.insert(identifierToMark)
             persistKnownItemIdentifiers()
 
+            // Skip the synthetic Cmd+drag for apps that spuriously
+            // activate on any tap at the icon location (Badgeify).
+            // Otherwise every title mutation ("System Status Item
+            // Clone" → per-badge title) triggers a new-item relocate
+            // and launches the proxied app. Accept macOS's default
+            // placement; the user can drag once via Layout editor
+            // if it lands wrong.
+            if shouldSkipBulkMove(for: candidate) {
+                MenuBarItemManager.diagLog.info(
+                    "relocateNewLeftmostItems: skipping move for \(candidate.logString) (bundle in skipBulkMoveBundleIDs); leaving at macOS default placement"
+                )
+                return true
+            }
+
             // Prefer the section this app's items have lived in before,
             // falling back to the user's New Items placement. This keeps
             // apps that mutate window titles (e.g. Badgeify encoding
