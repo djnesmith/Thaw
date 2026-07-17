@@ -390,7 +390,20 @@ final class MenuBarItemManager: ObservableObject {
     private func loadSavedSectionOrder() {
         let key = "MenuBarItemManager.savedSectionOrder"
         if let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: [String]] {
-            savedSectionOrder = stored
+            // Strip any identifiers whose namespace is in
+            // skipBulkMoveBundleIDs. Their positions are macOS-owned
+            // once the app was observed there (see computeSectionOrder);
+            // if a prior build persisted them, the planner would try to
+            // enforce that observed section on relaunch and repeatedly
+            // move a title-mutating app's items on every windowID cycle.
+            var cleaned = [String: [String]]()
+            for (sectionKey, ids) in stored {
+                let filtered = ids.filter { !Self.isSkipBulkMoveNamespace($0) }
+                if !filtered.isEmpty {
+                    cleaned[sectionKey] = filtered
+                }
+            }
+            savedSectionOrder = cleaned
         }
     }
 
@@ -398,7 +411,12 @@ final class MenuBarItemManager: ObservableObject {
     private func loadSavedSectionByNamespace() {
         let key = "MenuBarItemManager.savedSectionByNamespace"
         if let stored = UserDefaults.standard.dictionary(forKey: key) as? [String: String] {
-            savedSectionByNamespace = stored
+            // Same rationale as loadSavedSectionOrder: never let a
+            // skipBulkMoveBundleIDs namespace drive placement, so drop
+            // any persisted entry rather than surfacing it via
+            // savedSectionForNamespace or letting computeSectionByNamespace
+            // preserve a stale value.
+            savedSectionByNamespace = stored.filter { !Self.isSkipBulkMoveNamespace($0.key) }
         }
     }
 
@@ -537,6 +555,14 @@ final class MenuBarItemManager: ObservableObject {
             if item.tag == .visibleControlItem {
                 return true
             }
+            // Never persist positions of skipBulkMoveBundleIDs items:
+            // Thaw doesn't manage them (see shouldSkipBulkMove), and
+            // recording their currently-observed section poisons the
+            // saved layout with whatever macOS-default position they
+            // happen to land in.
+            if Self.isSkipBulkMoveNamespace(item.tag.namespace.description) {
+                return false
+            }
             return !item.isControlItem && item.sourcePID != nil
         }
 
@@ -602,13 +628,17 @@ final class MenuBarItemManager: ObservableObject {
                 where !item.isControlItem
                 && item.sourcePID != nil
                 && !item.isTransientControlCenterItem
+                && !shouldSkipBulkMove(for: item)
             {
                 let nsKey = item.tag.namespace.description
                 guard !nsKey.isEmpty, nsKey != "null" else { continue }
                 perNamespaceCounts[nsKey, default: [:]][section, default: 0] += 1
             }
         }
-        var result = savedSectionByNamespace
+        // Preserve entries for closed apps, but strip any that map to
+        // a skipBulkMoveBundleIDs namespace so the fallback in
+        // relocateNewLeftmostItems never surfaces a poisoned value.
+        var result = savedSectionByNamespace.filter { !Self.isSkipBulkMoveNamespace($0.key) }
         for (nsKey, counts) in perNamespaceCounts {
             if let top = counts.max(by: { $0.value < $1.value })?.key {
                 result[nsKey] = sectionKey(for: top)
@@ -3069,14 +3099,21 @@ extension MenuBarItemManager {
         "studio.techflow.badgeify",
     ]
 
+    /// Namespace-string variant of `shouldSkipBulkMove(for:)` for
+    /// contexts where the identifier is a `"namespace:title"` string or
+    /// a raw namespace description (persisted identifiers, saved
+    /// namespace map keys).
+    static func isSkipBulkMoveNamespace(_ namespaceOrIdentifier: String) -> Bool {
+        skipBulkMoveBundleIDs.contains(where: { namespaceOrIdentifier.contains($0) })
+    }
+
     /// Returns whether the given item should be excluded from bulk
     /// moves (e.g. full-sort within `applyProfileLayout`). Direct moves
     /// initiated by the user (drag in the Layout editor,
     /// `temporarilyShow`) still proceed — this only skips
     /// automation-driven bulk reshuffles.
     private func shouldSkipBulkMove(for item: MenuBarItem) -> Bool {
-        let namespaceString = item.tag.namespace.description
-        return Self.skipBulkMoveBundleIDs.contains(where: { namespaceString.contains($0) })
+        Self.isSkipBulkMoveNamespace(item.tag.namespace.description)
     }
 
     /// Returns the default timeout for move operations associated
@@ -6784,6 +6821,10 @@ extension MenuBarItemManager {
                             guard
                                 let item = freshItems.first(where: { $0.uniqueIdentifier == uid && isProfileItem($0) })
                             else { continue }
+                            if shouldSkipBulkMove(for: item) {
+                                MenuBarItemManager.diagLog.info("Profile layout (cross to AH): skipping bulk move for \(uid) (bundle in skipBulkMoveBundleIDs)")
+                                continue
+                            }
                             do {
                                 try await move(item: item, to: .leftOfItem(ahItem), skipInputPause: true)
                                 movedCount += 1
@@ -6809,6 +6850,10 @@ extension MenuBarItemManager {
                             guard
                                 let item = freshItems.first(where: { $0.uniqueIdentifier == uid && isProfileItem($0) })
                             else { continue }
+                            if shouldSkipBulkMove(for: item) {
+                                MenuBarItemManager.diagLog.info("Profile layout (cross to hidden): skipping bulk move for \(uid) (bundle in skipBulkMoveBundleIDs)")
+                                continue
+                            }
                             do {
                                 try await move(item: item, to: .rightOfItem(ahItem), skipInputPause: true)
                                 movedCount += 1
@@ -6907,6 +6952,15 @@ extension MenuBarItemManager {
                 guard let item = allFreshItems.first(where: {
                     $0.uniqueIdentifier == planned.uid && isProfileItem($0)
                 }) else {
+                    continue
+                }
+
+                // Same rationale as the full-sort path above: never
+                // dispatch a synthetic Cmd+drag to a
+                // skipBulkMoveBundleIDs item, or its owning app opens
+                // on every planned move.
+                if shouldSkipBulkMove(for: item) {
+                    MenuBarItemManager.diagLog.info("Profile layout (LCS): skipping bulk move for \(planned.uid) (bundle in skipBulkMoveBundleIDs)")
                     continue
                 }
 
