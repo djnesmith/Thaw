@@ -3107,11 +3107,15 @@ extension MenuBarItemManager {
         skipBulkMoveBundleIDs.contains(where: { namespaceOrIdentifier.contains($0) })
     }
 
-    /// Returns whether the given item should be excluded from bulk
-    /// moves (e.g. full-sort within `applyProfileLayout`). Direct moves
-    /// initiated by the user (drag in the Layout editor,
-    /// `temporarilyShow`) still proceed — this only skips
-    /// automation-driven bulk reshuffles.
+    /// Returns whether the given item should be excluded from Thaw-issued
+    /// moves. Applies to bulk layout paths (`applyProfileLayout`,
+    /// `relocateNewLeftmostItems`) AND single-item paths that would
+    /// synthesise a Cmd+drag on this item (`temporarilyShow`, the rehide
+    /// half, and `relocatePendingItems` after an app relaunch). Bundles
+    /// on this list have low-level event hooks that treat the synthesised
+    /// mouseDown as a plain click and open the target app, so Thaw
+    /// leaves them wherever macOS put them. Manual drags in the Layout
+    /// editor are still driven by real user input and unaffected.
     private func shouldSkipBulkMove(for item: MenuBarItem) -> Bool {
         Self.isSkipBulkMoveNamespace(item.tag.namespace.description)
     }
@@ -4337,6 +4341,17 @@ extension MenuBarItemManager {
             return .showFailed
         }
 
+        // Bundles on skipBulkMoveBundleIDs (e.g. Badgeify) intercept the
+        // synthesised mouseDown Thaw emits as part of the show → click →
+        // rehide dance and treat it as a plain click on their icon,
+        // opening the underlying app. Leave the item where macOS placed
+        // it rather than dragging it out of hidden. Returns .showFailed
+        // so the caller does NOT attempt a fallback click.
+        if shouldSkipBulkMove(for: item) {
+            MenuBarItemManager.diagLog.info("temporarilyShow: skipping \(item.logString) (bundle in skipBulkMoveBundleIDs)")
+            return .showFailed
+        }
+
         MenuBarItemManager.diagLog.debug("temporarilyShow: started for \(item.logString)")
 
         // Determine the displayID for this item.
@@ -4829,6 +4844,18 @@ extension MenuBarItemManager {
         }
 
         while let context = currentContexts.popLast() {
+            // Defense-in-depth: if a skipBulkMove context ended up here
+            // (stale from a run before temporarilyShow started bailing),
+            // drop it rather than moving the icon back — the rehide move
+            // would fire Badgeify's click hook.
+            if Self.isSkipBulkMoveNamespace(context.tag.tagIdentifier) {
+                MenuBarItemManager.diagLog.info("rehide: dropping skipBulkMove context \(context.tag)")
+                let tagIdentifier = context.tag.tagIdentifier
+                pendingRelocations.removeValue(forKey: tagIdentifier)
+                pendingReturnDestinations.removeValue(forKey: tagIdentifier)
+                continue
+            }
+
             guard let item = items.first(where: {
                 $0.tag.matchesIgnoringWindowID(context.tag) &&
                     ($0.sourcePID ?? $0.ownerPID) == context.sourcePID
@@ -5203,6 +5230,16 @@ extension MenuBarItemManager {
         let allTagIdentifiers = Array(pendingRelocations.keys)
         for tagIdentifier in allTagIdentifiers {
             guard let rawSectionString = pendingRelocations[tagIdentifier] else { continue }
+
+            // Drop stale skipBulkMove entries (Badgeify et al.) — moving
+            // them back after an app relaunch would fire the same
+            // Cmd+drag → app-open path we're trying to avoid.
+            if Self.isSkipBulkMoveNamespace(tagIdentifier) {
+                MenuBarItemManager.diagLog.info("relocatePendingItems: dropping skipBulkMove entry \(tagIdentifier)")
+                pendingRelocations.removeValue(forKey: tagIdentifier)
+                pendingReturnDestinations.removeValue(forKey: tagIdentifier)
+                continue
+            }
 
             // Parse the raw string into a typed PendingEntry for the planner.
             let entry: PendingLedger.PendingEntry
